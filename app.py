@@ -156,6 +156,166 @@ NICHES = [
 def get_niches():
     return jsonify(NICHES), 200
 
+
+
+@app.route('/influencer/campaigns', methods=['GET'])
+def list_all_campaigns():
+    search = request.args.get('search', '').lower()
+    visibility = request.args.get('visibility', 'all')
+    sort_by = request.args.get('sort_by', 'desc')
+
+    # Base query
+    query = Campaign.query.join(Sponsor).join(User)
+
+    # Exclude expired campaigns
+    current_date = datetime.utcnow()
+    query = query.filter(Campaign.end_date >= current_date)
+
+    # Apply search filter
+    if search:
+        query = query.filter(
+            Campaign.name.ilike(f'%{search}%') |
+            Campaign.description.ilike(f'%{search}%') |
+            User.username.ilike(f'%{search}%')  # Access Sponsor's username via User
+        )
+
+    # Apply visibility filter
+    if visibility != 'all':
+        query = query.filter(Campaign.visibility == visibility)
+
+    # Apply sorting
+    query = query.order_by(Campaign.budget.asc() if sort_by == 'asc' else Campaign.budget.desc())
+
+    # Fetch results
+    campaigns = query.all()
+
+    # Serialize and return data
+    return jsonify({
+        'campaigns': [
+            {
+                'id': campaign.id,
+                'name': campaign.name,
+                'description': campaign.description,
+                'start_date': campaign.start_date.isoformat(),
+                'end_date': campaign.end_date.isoformat(),
+                'budget': campaign.budget,
+                'visibility': campaign.visibility,
+                'sponsor': campaign.sponsor.user.username  # Corrected attribute
+            }
+            for campaign in campaigns
+        ]
+    })
+
+@app.route('/get_influencer_id', methods=['GET'])
+def get_influencer_id():
+    """
+    Fetch the currently logged-in influencer's ID.
+    """
+    user_id = session.get('user_id')
+    if not user_id:
+        return jsonify({'error': 'User not logged in'}), 401
+
+    influencer = Influencer.query.filter_by(id=user_id).first()
+    if not influencer:
+        return jsonify({'error': 'Influencer profile not found'}), 404
+
+    return jsonify({'influencer_id': influencer.id}), 200
+
+@app.route('/influencer/ad_requests', methods=['GET'])
+def influencer_ad_requests():
+    """
+    Endpoint to fetch ad requests categorized as ongoing, expired, and flagged
+    for an influencer.
+    """
+    influencer_id = session.get('user_id')  # Fetch logged-in influencer ID
+    if not influencer_id:
+        return jsonify({'error': 'Unauthorized access'}), 401
+
+    # Current date for filtering
+    today = datetime.today()
+
+    # Ongoing ad requests (not expired and associated with active campaigns)
+    ongoing_requests = AdRequest.query.join(Campaign).join(Sponsor).filter(
+        AdRequest.receiver_id == influencer_id,
+        Campaign.end_date >= today,
+        Campaign.flag == False,
+    ).all()
+
+    # Expired ad requests (campaign has ended)
+    expired_requests = AdRequest.query.join(Campaign).filter(
+        AdRequest.receiver_id == influencer_id,
+        Campaign.end_date < today,
+    ).all()
+
+    # Flagged ad requests (associated with flagged sponsors)
+    flagged_requests = AdRequest.query.join(Campaign).join(Sponsor).filter(
+        AdRequest.receiver_id == influencer_id,
+        Campaign.flag == True,
+        Campaign.end_date >= today,
+    ).all()
+
+    # Serialize data for response
+    def serialize_request(ad_request):
+        return {
+            'id': ad_request.id,
+            'campaign': {'id': ad_request.campaign.id, 'name': ad_request.campaign.name},
+            'sponsor': {'id': ad_request.campaign.sponsor_id, 'username': ad_request.campaign.sponsor.user.username},
+            'messages': ad_request.messages,
+            'requirements': ad_request.requirements,
+            'payment_amount': ad_request.payment_amount,
+            'status': ad_request.status,
+            'latest_sender': ad_request.latest_sender,  # Include the latest_sender field
+        }
+
+    response = {
+        'ongoing': [serialize_request(req) for req in ongoing_requests],
+        'expired': [serialize_request(req) for req in expired_requests],
+        'flagged': [serialize_request(req) for req in flagged_requests],
+    }
+
+    return jsonify(response), 200
+
+
+
+
+
+@app.route('/adrequest/<int:campaign_id>', methods=['POST'])
+def adrequest(campaign_id):
+    current_user_id = session.get('user_id')
+    influencer = Influencer.query.get_or_404(current_user_id)
+    campaign = Campaign.query.get_or_404(campaign_id)
+    
+    if request.method == 'POST':
+        data = request.json
+        messages = data['messages']
+        requirements = data['requirements']
+        payment_amount = float(data['payment_amount'])
+        
+        existing_request = AdRequest.query.filter_by(
+            campaign_id=campaign_id, 
+            influencer_id=influencer.id,
+            status='pending'
+        ).first()
+
+        if existing_request:
+            return jsonify({'error': 'Pending request already exists'}), 400
+        
+        ad_request = AdRequest(
+            campaign_id=campaign_id,
+            influencer_id=influencer.id,
+            sender_id=influencer.id,
+            receiver_id=campaign.sponsor_id,
+            messages=messages,
+            requirements=requirements,
+            payment_amount=payment_amount,
+            status='pending',
+            latest_sender=influencer.id
+        )
+        db.session.add(ad_request)
+        db.session.commit()
+        return jsonify({'message': 'Ad request submitted successfully'}), 200
+
+
 @app.route('/sponsor/profile', methods=['GET'])
 def get_sponsor_profile():
     user_id = session.get('user_id')
@@ -642,6 +802,199 @@ def pay_payment(payment_id):
     db.session.commit()
 
     return jsonify({'message': 'Payment successfully processed'})
+
+@app.route('/influencer/payments', methods=['GET'])
+def influencer_payments():
+    """
+    Fetch all payments for the logged-in influencer and categorize them as pending or paid.
+    """
+    influencer_id = session.get('user_id')  # Fetch the logged-in influencer's ID
+    if not influencer_id:
+        return jsonify({'error': 'Unauthorized access'}), 401
+
+    # Fetch all payments for the logged-in influencer
+    payments = PayInfo.query.filter_by(influencer_id=influencer_id).all()
+    print(payments)
+
+    # Serialize payment data
+    def serialize_payment(payment):
+        return {
+            'id': payment.id,
+            'campaign': {
+                'id': payment.campaign.id,
+                'name': payment.campaign.name
+            },
+            'amount': payment.amount,
+            'status': payment.status
+        }
+
+    # Split payments into pending and paid categories
+    pending_payments = [serialize_payment(payment) for payment in payments if payment.status == 'pending']
+    paid_payments = [serialize_payment(payment) for payment in payments if payment.status == 'paid']
+    print (pending_payments)
+    response = {
+        'pending_payments': pending_payments,
+        'paid_payments': paid_payments
+    }
+
+    return jsonify(response), 200
+
+
+@app.route('/admin/dashboard', methods=['GET'])
+def admin_dashboard():
+    """
+    Fetches a summary of key metrics for the admin dashboard.
+    """
+    if 'user_id' not in session or session['role'] != 'admin':
+        return jsonify({'error': 'Unauthorized access'}), 401
+
+    # Fetch data for admin summary
+    try:
+        total_users = User.query.count()
+        total_campaigns = Campaign.query.count()
+        flagged_users = Influencer.query.filter(Influencer.flag == True).count()
+        flagged_campaigns = Campaign.query.filter(Campaign.flag == True).count()
+
+        response = {
+            'total_users': total_users,
+            'total_campaigns': total_campaigns,
+            'flagged_users': flagged_users,
+            'flagged_campaigns': flagged_campaigns
+        }
+        return jsonify(response), 200
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/admin/active_entities', methods=['GET'])
+def get_active_entities():
+    """
+    Fetch active influencers or campaigns based on the 'type' filter.
+    """
+    entity_type = request.args.get('type')
+    if not entity_type:
+        return jsonify({'error': 'Missing type parameter'}), 400
+
+    if entity_type == 'influencers':
+        influencers = Influencer.query.filter_by(flag=0).all()
+        result = [
+            {
+                'id': influencer.id,
+                'username': influencer.user.username,
+                'category': influencer.category,
+                'niche': influencer.niche,
+                'reach': influencer.reach,
+                'flagged': influencer.flag,
+            }
+            for influencer in influencers
+        ]
+    elif entity_type == 'campaigns':
+        campaigns = Campaign.query.filter_by(flag=0).all()
+        result = [
+            {
+                'id': campaign.id,
+                'name': campaign.name,
+                'sponsor_id': campaign.sponsor_id,
+                'end_date': campaign.end_date.strftime('%Y-%m-%d') if campaign.end_date else None,
+                'flagged': campaign.flag,
+            }
+            for campaign in campaigns
+        ]
+    else:
+        return jsonify({'error': 'Invalid type parameter'}), 400
+
+    return jsonify(result), 200
+
+
+@app.route('/admin/flag_entity', methods=['POST'])
+def toggle_flag_entity():
+    """
+    Toggle the 'flag' status of an influencer or campaign.
+    """
+    data = request.json
+    entity_type = data.get('type')
+    entity_id = data.get('id')
+
+    if not entity_type or not entity_id:
+        return jsonify({'error': 'Missing parameters'}), 400
+
+    if entity_type == 'influencers':
+        entity = Influencer.query.get(entity_id)
+    elif entity_type == 'campaigns':
+        entity = Campaign.query.get(entity_id)
+    else:
+        return jsonify({'error': 'Invalid type parameter'}), 400
+
+    if not entity:
+        return jsonify({'error': f'{entity_type.capitalize()} not found'}), 404
+
+    # Toggle flag
+    entity.flag = 1 if entity.flag == 0 else 0
+    db.session.commit()
+
+    status = 'flagged' if entity.flag == 1 else 'unflagged'
+    return jsonify({'message': f'{entity_type.capitalize()} successfully {status}'}), 200
+
+@app.route('/admin/flagged_users', methods=['GET'])
+def get_flagged_users():
+    """
+    Fetch all flagged users (influencers) from the database.
+    """
+    flagged_users = Influencer.query.filter_by(flag=True).all()
+    users_data = [
+        {
+            'id': user.id,
+            'username': user.user.username,
+            'email': user.user.email,
+        }
+        for user in flagged_users
+    ]
+    return jsonify({'entities': users_data}), 200
+
+
+@app.route('/admin/flagged_campaigns', methods=['GET'])
+def get_flagged_campaigns():
+    """
+    Fetch all flagged campaigns from the database.
+    """
+    flagged_campaigns = Campaign.query.filter_by(flag=True).all()
+    campaigns_data = [
+        {
+            'id': campaign.id,
+            'name': campaign.name,
+            'sponsor': campaign.sponsor.user.username,
+        }
+        for campaign in flagged_campaigns
+    ]
+    return jsonify({'entities': campaigns_data}), 200
+
+
+@app.route('/admin/unflag_user/<int:user_id>', methods=['POST'])
+def unflag_user(user_id):
+    """
+    Unflag a specific user (influencer).
+    """
+    influencer = Influencer.query.get(user_id)
+    if not influencer:
+        return jsonify({'error': 'User not found'}), 404
+
+    influencer.flag = False
+    db.session.commit()
+    return jsonify({'message': 'User successfully unflagged'}), 200
+
+
+@app.route('/admin/unflag_campaign/<int:campaign_id>', methods=['POST'])
+def unflag_campaign(campaign_id):
+    """
+    Unflag a specific campaign.
+    """
+    campaign = Campaign.query.get(campaign_id)
+    if not campaign:
+        return jsonify({'error': 'Campaign not found'}), 404
+
+    campaign.flag = False
+    db.session.commit()
+    return jsonify({'message': 'Campaign successfully unflagged'}), 200
+
 
 
 if __name__ == '__main__':
